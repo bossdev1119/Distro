@@ -21,7 +21,7 @@ file to open to see it. Read it with the code open next to it. Every section end
 7. [Magic-link auth, step by step](#7-magic-link-auth-step-by-step)
 8. [Onboarding: form → API → event](#8-onboarding-form--api--event)
 9. [Inngest: background jobs that survive failure](#9-inngest-background-jobs-that-survive-failure)
-10. [Calling Claude: structured, validated JSON](#10-calling-claude-structured-validated-json)
+10. [Calling the LLM: structured, validated JSON](#10-calling-the-llm-structured-validated-json)
 11. [The profile editor: polling and forms](#11-the-profile-editor-polling-and-forms)
 12. [TypeScript and zod patterns used everywhere](#12-typescript-and-zod-patterns-used-everywhere)
 13. [Tooling: typecheck, lint, build, and testing SQL](#13-tooling-typecheck-lint-build-and-testing-sql)
@@ -45,7 +45,7 @@ Browser                         Next.js server                      Background (
                                       send event "startup.created" ──▶ build-profile job
                                                                        ├ fetch homepage
                                                                        ├ fetch /pricing, /about
-                                                                       ├ ask Claude for JSON
+                                                                       ├ ask the LLM for JSON
                                                                        └ save profile, status=ready
 /startups/:id/profile
    polls GET /api/startups/:id every 2s ◀── reads status from DB
@@ -75,7 +75,7 @@ backend engineering. You'll reuse it in every later milestone: discovery, scorin
 | **shadcn/ui** | "Copy-paste components you own." | `components/ui/*`, generated, editable |
 | **Supabase** | "Postgres + login system + a security layer inside the DB." | Data, magic links, RLS |
 | **Inngest** | "A to-do list for the server that retries until it's done." | Runs `build-profile` reliably |
-| **Anthropic SDK** | "Typed client for Claude." | Turns web pages into a profile |
+| **Gemini / Claude** | "An LLM behind one function, swappable." | Turns web pages into a profile |
 | **zod** | "A runtime bouncer for data." | Validates input, LLM output, env vars |
 | **Jina Reader** | "Any URL → clean markdown." | `https://r.jina.ai/<url>` |
 
@@ -111,7 +111,7 @@ lib/
   api.ts                      ← small helpers for route handlers
   audit.ts                    ← write to audit_log
   supabase/                   ← 3 Supabase clients + proxy helper
-  llm/                        ← Claude calls + zod schemas
+  llm/                        ← generateJson, prompts, zod schemas, providers/
   fetch/reader.ts             ← Jina Reader
   db/                         ← hand-written row types
 supabase/migrations/0001_init.sql ← the whole database schema
@@ -600,8 +600,8 @@ Open [jobs/build-profile.ts](jobs/build-profile.ts). This is the most important 
 later step fails and the function is retried, finished steps **don't run again**: Inngest hands back
 their saved result instantly.
 
-So if Claude times out in `generate-profile`, the retry does **not** re-fetch the three web pages. It
-jumps straight back to the Claude call. Without steps you'd redo everything on every failure.
+So if the LLM times out in `generate-profile`, the retry does **not** re-fetch the three web pages. It
+jumps straight back to the LLM call. Without steps you'd redo everything on every failure.
 
 Consequences you must respect:
 - **Step results must be JSON-serializable** (they get stored). That's also why page markdown is cut
@@ -643,11 +643,20 @@ A 404 or a permanently invalid input: no, fail fast.
 
 ---
 
-## 10. Calling Claude: structured, validated JSON
+## 10. Calling the LLM: structured, validated JSON
 
-Two files: [lib/llm/client.ts](lib/llm/client.ts) (generic) and
-[lib/llm/profile.ts](lib/llm/profile.ts) (profile-specific). The prompt and the plumbing are kept
-separate on purpose: M2's scoring and drafting will reuse `generateJson` with different prompts.
+The LLM code is split into layers:
+
+```
+lib/llm/profile.ts          the prompt (what to ask)              ← knows nothing about providers
+lib/llm/client.ts           generateJson(): retry + zod checks    ← knows nothing about Gemini/Claude
+lib/llm/providers/gemini.ts     how to call Google Gemini          ← default (free tier)
+lib/llm/providers/anthropic.ts  how to call Anthropic Claude
+lib/llm/providers/types.ts      the shared contract (LlmProvider)
+```
+
+The prompt and the plumbing are kept separate on purpose: M2's scoring and drafting will reuse
+`generateJson` with different prompts. Section 10.5 explains why the providers are split out.
 
 ### 10.1 The schema is the contract
 
@@ -663,8 +672,8 @@ export type StartupProfile = z.infer<typeof startupProfileSchema>;
 ```
 
 This single schema is used in **four** places:
-1. It's turned into a JSON Schema that **constrains Claude's output**.
-2. It **validates** Claude's response.
+1. It's turned into a JSON Schema that **constrains the model's output**.
+2. It **validates** the model's response.
 3. It **validates** the edited profile in the API (`PUT`/`POST .../profile`).
 4. It **validates** the form in the browser before sending.
 
@@ -673,21 +682,48 @@ This single schema is used in **four** places:
 
 ### 10.2 Structured outputs
 
+Both providers support **structured outputs**: you hand the API a JSON Schema, and it constrains
+generation so the reply is valid JSON of that shape. That's much stronger than writing "please reply in
+JSON" in a prompt.
+
+**Gemini** ([providers/gemini.ts](lib/llm/providers/gemini.ts)):
+
 ```ts
-const response = await anthropic().beta.messages.parse({
-  model, max_tokens: maxTokens, system,
-  messages: [{ role: "user", content: user }],
-  output_config: { format: betaZodOutputFormat(schema) },
-  betas: ["server-side-fallback-2026-07-01"],
-  fallbacks: "default",
+const response = await gemini().models.generateContent({
+  model: modelFor(task),
+  contents: user,
+  config: {
+    systemInstruction: system,
+    responseMimeType: "application/json",
+    responseJsonSchema: toGeminiSchema(schema),   // zod → JSON Schema via z.toJSONSchema()
+    maxOutputTokens: maxTokens,
+  },
 });
 ```
 
-- `output_config.format` means **structured outputs**: the API constrains generation so the reply is
-  valid JSON matching the schema. That's much stronger than "please reply in JSON" in a prompt.
-- `.parse(...)` also parses the JSON for you into `response.parsed_output`.
-- `fallbacks: "default"`: if a safety classifier declines the request, the API re-runs it on a
-  recommended fallback model instead of just refusing.
+zod v4 can convert a schema to standard JSON Schema by itself (`z.toJSONSchema`). For our profile that
+produces `{"type":"object","properties":{"one_liner":{"type":"string","minLength":1,"description":...}}...}`,
+and the `.describe()` texts go along as instructions.
+
+**Claude** ([providers/anthropic.ts](lib/llm/providers/anthropic.ts)) uses the Anthropic SDK's zod helper:
+
+```ts
+const response = await anthropic().beta.messages.parse({
+  model: MODELS[task], max_tokens: maxTokens, system,
+  messages: [{ role: "user", content: user }],
+  output_config: { format: betaZodOutputFormat(schema) },
+  betas: ["server-side-fallback-2026-07-01"],
+  fallbacks: "default",   // if a safety check declines, re-run on a fallback model
+});
+```
+
+Different vocabulary (`systemInstruction` vs `system`, `finishReason: "MAX_TOKENS"` vs
+`stop_reason: "max_tokens"`), same idea. Each provider file **translates** its API's vocabulary into
+one shared answer:
+
+```ts
+type JsonAttempt = { kind: "ok"; value: unknown } | { kind: "retry"; problem: string };
+```
 
 ### 10.3 Why validate again, and retry once?
 
@@ -703,8 +739,9 @@ attempt 1 → refusal?            → throw (a retry won't change a policy decis
 attempt 2 → same checks → otherwise throw LlmOutputError
 ```
 
-The rule: each layer retries **only the failures it's responsible for**. The SDK retries network and
-429 errors, `generateJson` retries bad output, and Inngest retries whole steps.
+The rule: each layer retries **only the failures it's responsible for**. The SDK and Inngest retry
+network and 429 (rate-limit) errors, `generateJson` retries bad output, and Inngest retries whole steps.
+On Gemini's free tier you'll hit 429s sometimes. Inngest waits and retries the step, so it heals itself.
 
 ### 10.4 The prompt
 
@@ -719,6 +756,55 @@ The rule: each layer retries **only the failures it's responsible for**. The SDK
 
 > **Try it:** change the `tone` description to "Three adjectives, comma-separated." and rebuild a
 > profile. See how much `.describe()` steers the output.
+
+### 10.5 Swapping providers: the adapter pattern
+
+We started on Claude, then switched to Gemini's free tier. Look at what that change touched:
+
+| Changed | Unchanged |
+|---|---|
+| `lib/llm/providers/*` (new), `client.ts`, `env.ts` | The prompt, the job, the database, every route and page |
+| `profile.ts`: one word (`model: MODELS.profile` → `task: "profile"`) | |
+
+That's the **adapter pattern**: define one interface your app needs and write one small "adapter" per
+outside service that fits it:
+
+```ts
+// providers/types.ts
+export interface LlmProvider {
+  readonly name: string;
+  generate(request: JsonRequest): Promise<JsonAttempt>;
+}
+```
+
+`client.ts` picks the adapter from `.env.local`:
+
+```ts
+const PROVIDERS = { anthropic: anthropicProvider, gemini: geminiProvider };
+function provider() { return PROVIDERS[serverEnv().LLM_PROVIDER]; }
+```
+
+Two design choices worth copying:
+
+- **Callers say *what* they're doing, not *which model*.** `generateJson({ task: "profile", ... })`.
+  Each provider maps tasks to its own models (Gemini: `GEMINI_MODEL`/`GEMINI_FAST_MODEL`; Claude:
+  Sonnet/Haiku). Model names stay in one place per provider.
+- **Env validation follows the choice.** In [lib/env.ts](lib/env.ts), `superRefine` requires
+  `GEMINI_API_KEY` *only if* `LLM_PROVIDER=gemini`, and the same for Anthropic. You never need a key for
+  a provider you aren't using.
+
+We also avoid hard-coding a Gemini version: the defaults are Google's `gemini-flash-latest` and
+`gemini-flash-lite-latest` **aliases**, which always point at the current models, so a retired version
+can't break the app.
+
+**The trade-off:** a common interface can only offer what every provider supports. Claude-only features
+(like `fallbacks`) live inside the Claude adapter, and callers can't ask for them. That's fine here;
+just be aware of it.
+
+> **Try it:** add a third provider. Groq and Ollama both expose an OpenAI-compatible API. Create
+> `providers/ollama.ts` that `fetch`es `http://localhost:11434/api/chat` with `format: <json schema>`,
+> register it in `PROVIDERS`, and add `"ollama"` to the `LLM_PROVIDER` enum. Nothing else should need to
+> change. If something does, the abstraction leaked.
 
 ---
 

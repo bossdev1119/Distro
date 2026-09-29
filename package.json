@@ -8,11 +8,13 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "next typegen && tsc --noEmit",
-    "inngest": "npx --yes inngest-cli@latest dev -u http://localhost:3000/api/inngest"
+    "inngest": "npx --yes inngest-cli@latest dev -u http://localhost:3000/api/inngest",
+    "dev:login": "node scripts/dev-login.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.129.0",
     "@base-ui/react": "^1.8.0",
+    "@google/genai": "^2.24.0",
     "@supabase/ssr": "^0.12.7",
     "@supabase/supabase-js": "^2.117.2",
     "class-variance-authority": "^0.7.1",

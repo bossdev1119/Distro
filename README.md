@@ -9,7 +9,7 @@ replies and signups. See [CLAUDE.md](CLAUDE.md) for the product spec and hard ru
 ## Stack
 
 Next.js 16 (App Router) · TypeScript · Tailwind v4 · shadcn/ui · Supabase (Postgres, Auth, RLS) ·
-Inngest (background jobs) · Anthropic SDK (`claude-sonnet-5-5`) · Jina Reader (page → markdown).
+Inngest (background jobs) · LLM: Google Gemini (free tier, default) or Anthropic Claude · Jina Reader (page → markdown).
 
 ## Setup
 
@@ -38,10 +38,19 @@ cp .env.example .env.local
 5. **Authentication → Sign In / Providers → Email**: make sure Email is enabled.
    The built-in mailer is rate-limited (a few emails/hour) — fine for testing; configure SMTP for real use.
 
-### 3. Anthropic
+### 3. LLM provider
 
-Put your key in `ANTHROPIC_API_KEY`. The profile uses `claude-sonnet-5-5` with structured outputs and
-server-side refusal fallback enabled.
+The app talks to the LLM through one function, `generateJson()` in `lib/llm/client.ts`. Pick a provider:
+
+- **Gemini (default, free tier):** get a key at [aistudio.google.com](https://aistudio.google.com) → *Get API key*.
+  Set `LLM_PROVIDER=gemini` and `GEMINI_API_KEY`. Models default to Google's `gemini-flash-latest` /
+  `gemini-flash-lite-latest` aliases; override with `GEMINI_MODEL` / `GEMINI_FAST_MODEL`.
+  On the free tier Google may use prompts to improve its products, and rate limits are low
+  (fine for development — Inngest retries rate-limited steps).
+- **Anthropic:** set `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`. Uses `claude-sonnet-5-5` with
+  structured outputs and server-side refusal fallback.
+
+Only the chosen provider's key is required.
 
 ### 4. Jina Reader (optional key)
 
@@ -65,6 +74,7 @@ The Inngest dev server discovers functions at `http://localhost:3000/api/inngest
 | ------------------- | ------------------------------------- |
 | `npm run dev`       | Next.js dev server                    |
 | `npm run inngest`   | Local Inngest dev server + dashboard  |
+| `npm run dev:login -- you@x.com` | Print a sign-in link without sending email (local dev only; dodges Supabase's email rate limit) |
 | `npm run typecheck` | Generate route types, run `tsc`       |
 | `npm run lint`      | ESLint                                |
 | `npm run build`     | Production build                      |
@@ -80,7 +90,7 @@ The Inngest dev server discovers functions at `http://localhost:3000/api/inngest
                               jobs/build-profile.ts
                               ├─ fetch homepage (required, retried)
                               ├─ fetch /pricing, /about (skipped if 404)
-                              ├─ lib/llm/profile.ts → Claude → zod-validated JSON (1 retry on bad output)
+                              ├─ lib/llm/profile.ts → Gemini/Claude → zod-validated JSON (1 retry on bad output)
                               └─ save startups.profile_json, status=ready   (or failed + profile_error)
                                                │
 /startups/:id/profile ◀── polls GET /api/startups/:id every 2s
@@ -108,7 +118,7 @@ app/                  pages + API routes (app/(app)/* requires auth)
 proxy.ts              session refresh + auth redirect (Next 16's renamed middleware)
 inngest/client.ts     Inngest client + typed events
 jobs/                 Inngest functions
-lib/llm/              Claude calls + zod schemas
+lib/llm/              generateJson + prompts + zod schemas; providers/ = gemini, anthropic
 lib/fetch/reader.ts   Jina Reader fetch
 lib/supabase/         browser / server / admin / proxy clients
 supabase/migrations/  SQL migrations

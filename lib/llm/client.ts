@@ -1,32 +1,24 @@
 import "server-only";
-import Anthropic from "@anthropic-ai/sdk";
-import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import type { z } from "zod";
 import { serverEnv } from "@/lib/env";
+import { anthropicProvider } from "./providers/anthropic";
+import { geminiProvider } from "./providers/gemini";
+import { LlmOutputError, type LlmProvider, type LlmTask } from "./providers/types";
 
-export const MODELS = {
-  profile: "claude-sonnet-5-5",
-  drafts: "claude-sonnet-5-5",
-  scoring: "claude-haiku-4-5",
-  classify: "claude-haiku-4-5",
-} as const;
+export { LlmOutputError, type LlmTask };
 
-let client: Anthropic | undefined;
+const PROVIDERS: Record<"anthropic" | "gemini", LlmProvider> = {
+  anthropic: anthropicProvider,
+  gemini: geminiProvider,
+};
 
-export function anthropic(): Anthropic {
-  client ??= new Anthropic({ apiKey: serverEnv().ANTHROPIC_API_KEY });
-  return client;
-}
-
-export class LlmOutputError extends Error {
-  constructor(message: string, readonly attempts: number) {
-    super(message);
-    this.name = "LlmOutputError";
-  }
+/** The provider chosen by LLM_PROVIDER in .env.local. */
+function provider(): LlmProvider {
+  return PROVIDERS[serverEnv().LLM_PROVIDER];
 }
 
 type JsonCallArgs<S extends z.ZodType> = {
-  model: string;
+  task: LlmTask;
   system: string;
   user: string;
   schema: S;
@@ -34,53 +26,34 @@ type JsonCallArgs<S extends z.ZodType> = {
 };
 
 /**
- * Calls Claude with structured outputs constrained to `schema`, then validates with zod.
+ * Asks the configured LLM for JSON matching `schema`, then validates it with zod.
  * Retries once if the output is missing, truncated or fails validation.
- * API errors (rate limits, 5xx) are left to the SDK's own retries and the caller (Inngest step).
+ * API errors (rate limits, 5xx) propagate to the caller (the Inngest step retries them).
  */
 export async function generateJson<S extends z.ZodType>({
-  model,
+  task,
   system,
   user,
   schema,
-  maxTokens = 8000,
+  maxTokens = 16000,
 }: JsonCallArgs<S>): Promise<z.infer<S>> {
   const maxAttempts = 2;
+  const llm = provider();
   let lastProblem = "unknown";
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const response = await anthropic().beta.messages.parse({
-        model,
-        max_tokens: maxTokens,
-        system,
-        messages: [{ role: "user", content: user }],
-        output_config: { format: betaZodOutputFormat(schema) },
-        // Re-run on Anthropic's recommended model if a safety classifier declines.
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
-      });
-
-      if (response.stop_reason === "refusal") {
-        throw new LlmOutputError(
-          `Model declined the request (${response.stop_details?.category ?? "unspecified"})`,
-          attempt,
-        );
-      }
-      if (response.stop_reason === "max_tokens") {
-        lastProblem = "output was truncated (max_tokens)";
-        continue;
-      }
-
-      const result = schema.safeParse(response.parsed_output);
-      if (result.success) return result.data;
-      lastProblem = result.error.message;
-    } catch (error) {
-      if (error instanceof Anthropic.APIError || error instanceof LlmOutputError) throw error;
-      // SDK-side JSON/schema parse failure: treat like a validation failure and retry.
-      lastProblem = error instanceof Error ? error.message : String(error);
+    const result = await llm.generate({ task, system, user, schema, maxTokens });
+    if (result.kind === "retry") {
+      lastProblem = result.problem;
+      continue;
     }
+    const parsed = schema.safeParse(result.value);
+    if (parsed.success) return parsed.data;
+    lastProblem = parsed.error.message;
   }
 
-  throw new LlmOutputError(`LLM output failed validation after ${maxAttempts} attempts: ${lastProblem}`, maxAttempts);
+  throw new LlmOutputError(
+    `${llm.name} output failed validation after ${maxAttempts} attempts: ${lastProblem}`,
+    maxAttempts,
+  );
 }

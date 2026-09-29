@@ -1,5 +1,5 @@
 import "server-only";
-import { generateJson, MODELS } from "./client";
+import { generateJson } from "./client";
 import { startupProfileSchema, type StartupProfile } from "./schemas";
 
 export type ProfilePage = { url: string; markdown: string };
@@ -42,5 +42,5 @@ ${pages || "(no pages could be fetched — rely on the URL and founder notes)"}
 
 Return the product profile.`;
 
-  return generateJson({ model: MODELS.profile, system: SYSTEM, user, schema: startupProfileSchema });
+  return generateJson({ task: "profile", system: SYSTEM, user, schema: startupProfileSchema });
 }

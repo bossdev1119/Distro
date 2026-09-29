@@ -29,9 +29,12 @@ A founder pastes their startup URL. The app:
 - Next.js (App Router) + TypeScript + Tailwind + shadcn/ui
 - Supabase (Postgres, Auth, Row Level Security) — migrations in supabase/migrations
 - Inngest for background jobs (event-driven, retryable)
-- Anthropic TypeScript SDK (@anthropic-ai/sdk):
-  - claude-sonnet-5-5 for profile + drafts
-  - claude-haiku-4-5 for scoring + reply classification
+- LLM behind one interface (lib/llm/client.ts → generateJson), provider chosen by LLM_PROVIDER:
+  - gemini (default, free tier, @google/genai): GEMINI_MODEL for profile + drafts,
+    GEMINI_FAST_MODEL for scoring + reply classification
+  - anthropic (@anthropic-ai/sdk): claude-sonnet-5-5 for profile + drafts,
+    claude-haiku-4-5 for scoring + reply classification
+  - Callers pass a task ("profile" | "drafts" | "scoring" | "classify"), never a model id.
   - All LLM outputs are strict JSON validated with zod; retry once on validation failure.
 - YouTube Data API v3, a web search API (Tavily or Serper), Firecrawl or Jina Reader for page fetching
 - Gmail API (scopes: gmail.send, gmail.readonly)
