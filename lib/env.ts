@@ -11,6 +11,9 @@ const serverEnvSchema = z
     GEMINI_API_KEY: z.string().optional(),
     GEMINI_MODEL: z.string().min(1).default("gemini-flash-latest"),
     GEMINI_FAST_MODEL: z.string().min(1).default("gemini-flash-lite-latest"),
+    // Embeddings always use Gemini (Anthropic has no embeddings API), so they need GEMINI_API_KEY.
+    GEMINI_MODEL_EMBED: z.string().min(1).default("gemini-embedding-001"),
+    YOUTUBE_API_KEY: z.string().optional(),
     ANTHROPIC_API_KEY: z.string().optional(),
     JINA_API_KEY: z.string().optional(),
     NEXT_PUBLIC_SITE_URL: z.url().default("http://localhost:3000"),

@@ -42,11 +42,15 @@ A founder pastes their startup URL. The app:
 ## Structure
 - app/            pages + api routes; app/c/[slug]/route.ts is the tracking redirect
 - lib/llm/        profile.ts, channels.ts, score.ts, draft.ts, classify.ts (+ zod schemas)
-- lib/discovery/  youtube.ts, search.ts, email-extract.ts
+- lib/discovery/  one module per platform (youtube.ts now; search.ts etc. later) + http.ts (retries),
+                  quota.ts, types.ts, email-extract.ts
+- lib/analysis/   pure scoring functions (demand.ts, score.ts, context.ts); unit-tested in tests/
+- lib/config.ts   every tunable number for discovery (thresholds, filters, weights, quota stop)
 - lib/gmail/      send, poll threads, token refresh
 - lib/crypto.ts, lib/limits.ts, lib/db/
-- jobs/           Inngest functions: build-profile, discover-creators, score-creators,
-                  generate-drafts, send-email, poll-replies, classify-reply
+- jobs/           Inngest functions: build-profile, build-context, generate-queries, youtube-search,
+                  score-relevance, estimate-demand, build-creators, score-creators;
+                  later: generate-drafts, send-email, poll-replies, classify-reply
 
 ## Data model
 startups, campaigns, creators (shared pool, unique platform+handle), matches,

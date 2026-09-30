@@ -1,6 +1,6 @@
-# Learning Distro: what we built in Milestone 1, and why
+# Learning Distro: what we built, and why
 
-This guide explains every piece of Milestone 1 (M1): what it does, **why** it's built that way, and which
+This guide explains every piece of Milestone 1 (M1, sections 0–16) and Milestone 2 (M2, sections 17–29): what it does, **why** it's built that way, and which
 file to open to see it. Read it with the code open next to it. Every section ends with a
 **"Try it"** exercise. Do them, because typing and breaking things is how this actually sticks.
 
@@ -28,6 +28,22 @@ file to open to see it. Read it with the code open next to it. Every section end
 14. [Mistakes made along the way (and lessons)](#14-mistakes-made-along-the-way-and-lessons)
 15. [Exercises to cement it](#15-exercises-to-cement-it)
 16. [Glossary](#16-glossary)
+
+**Part 2: Milestone 2 (YouTube discovery)**
+
+17. [The M2 picture: from profile to top 30 creators](#17-the-m2-picture-from-profile-to-top-30-creators)
+18. [Embeddings and cosine similarity](#18-embeddings-and-cosine-similarity)
+19. [pgvector: vectors inside Postgres](#19-pgvector-vectors-inside-postgres)
+20. [Search queries in the viewer's words](#20-search-queries-in-the-viewers-words)
+21. [API quotas, pagination, batching ids, caching](#21-api-quotas-pagination-batching-ids-caching)
+22. [Retries, backoff, and typed errors](#22-retries-backoff-and-typed-errors)
+23. [Upserts and unique constraints](#23-upserts-and-unique-constraints)
+24. [Estimating demand (and why it's only an estimate)](#24-estimating-demand-and-why-its-only-an-estimate)
+25. [Building and ranking creators](#25-building-and-ranking-creators)
+26. [Batches of 20, idempotency, and sleeping until tomorrow](#26-batches-of-20-idempotency-and-sleeping-until-tomorrow)
+27. [The Audience & Creators page: data fetching](#27-the-audience--creators-page-data-fetching)
+28. [Unit tests with Vitest](#28-unit-tests-with-vitest)
+29. [M2 lessons and exercises](#29-m2-lessons-and-exercises)
 
 ---
 
@@ -1022,6 +1038,598 @@ Do these in order. Each one is small, and each one touches a different layer.
 
 ---
 
-**Next milestone preview (M2):** a new job subscribes to `profile.confirmed`, uses the profile's
-`icp` and `keywords` to map channels (YouTube niches, newsletters...), and starts creator discovery.
-You now know every building block it will use: events, steps, `generateJson`, admin client, RLS.
+# Part 2: Milestone 2 (YouTube discovery)
+
+M2 answers two questions for a founder: **"How many people care about my problem, and where?"** and
+**"Which small YouTubers talk to those people?"** It uses only the official YouTube Data API, the
+confirmed profile from M1, and Gemini's free tier.
+
+---
+
+## 17. The M2 picture: from profile to top 30 creators
+
+```
+Confirm profile ──▶ profile.confirmed
+                      └▶ build-context       profile → text → embedding (768 numbers) → startup_context
+                           context.built
+                      └▶ generate-queries    LLM writes 3–5 niches × 4–6 viewer-style searches → search_queries
+"Find creators" ──▶ campaign row ──▶ /campaigns/:id/creators  (founder edits the queries)
+"Start search"  ──▶ queries.confirmed
+                      └▶ youtube-search      one search per query (100 units) + stats per 50 videos (1 unit)
+                           youtube.searched
+                      └▶ score-relevance     embed every video, relevance = cosine similarity (in SQL)
+                           relevance.scored
+                      └▶ estimate-demand     Σ views × relevance per niche
+                           demand.estimated
+                      └▶ build-creators      group videos by channel, channel stats, filters, rank_score
+                           creators.built
+                      └▶ score-creators      LLM "fit" in batches of 20 until 30 are scored
+```
+
+Each arrow is an **event**, and each box is its own Inngest function in [jobs/](jobs/). Why not one big
+function? Each stage can fail, retry, and be inspected **on its own** in the Inngest dashboard
+(http://localhost:8288 → Runs). You can also re-run just one stage by re-sending its event, and a
+later platform (say Reddit) can listen to `queries.confirmed` without touching YouTube code.
+
+**The data flows through the database, not through events.** Events only carry ids
+(`{ campaignId, startupId }`). Each job loads what it needs. Events stay tiny, and every
+intermediate result is visible in Supabase's Table Editor.
+
+**Why top 30 and not 100?** You chose 30 small channels for small startups.
+`DISCOVERY.campaignSize` in [lib/config.ts](lib/config.ts) controls it, so expanding later is a
+one-number change (plus quota).
+
+---
+
+## 18. Embeddings and cosine similarity
+
+### What an embedding is
+
+An **embedding** turns text into a list of numbers (here 768) that captures its **meaning**. Think of
+it as coordinates in a 768-dimensional "meaning space". Texts about similar things land near each
+other, even when they share no words.
+
+```
+"How to get clients to pay invoices on time"   → [0.021, -0.113, 0.087, ...]  (768 numbers)
+"Freelancers: stop chasing late payments"      → [0.019, -0.108, 0.091, ...]  ← close by
+"India vs Australia cricket highlights"        → [-0.074, 0.032, -0.005, ...] ← far away
+```
+
+A model learned those coordinates from billions of sentences, so words like *invoice*, *late
+payment* and *billing* end up pointing in similar directions.
+
+### Cosine similarity
+
+To compare two vectors we measure the **angle** between them, not the distance:
+
+```
+cosine similarity = (A · B) / (|A| × |B|)
+   1.0  → same direction   → same meaning
+   0.0  → perpendicular    → unrelated
+```
+
+`A · B` (the dot product) multiplies matching numbers and adds them up. Dividing by the lengths
+removes "how long the text was", so only direction (meaning) counts.
+
+### Why this beats keyword matching
+
+| Keyword match | Embedding match |
+|---|---|
+| "invoice" misses a video titled "Getting paid as a freelancer" | Understands they're about the same thing |
+| "Python" matches both the snake and the language | Context decides which one is meant |
+| Needs you to guess every synonym | Synonyms come for free |
+
+### We measured it (and changed the brief's threshold)
+
+Before writing code we embedded three sentences with **your** Gemini key:
+
+```
+invoice vs invoice-app : 0.841
+invoice vs cricket     : 0.674   ← unrelated, but still 0.67!
+```
+
+Gemini's embeddings rarely go near 0 for normal text, and even unrelated sentences score about
+0.6–0.7. A threshold of 0.6 would have kept **everything**. That's why
+`relevanceThreshold` starts at **0.75** in [lib/config.ts](lib/config.ts). **Lesson: measure before
+you trust a number from a spec.**
+
+### Where it lives in the code
+
+- [lib/analysis/context.ts](lib/analysis/context.ts) builds the context text from the one-liner,
+  problem, ICP, use cases and keywords. `tone` and `creator_offer` are left out: they describe
+  outreach, not the topic, and would blur the vector.
+- [lib/llm/client.ts](lib/llm/client.ts) has `embed(text)` and `embedMany(texts)`, which send up to
+  100 texts per API call.
+- [lib/llm/providers/gemini.ts](lib/llm/providers/gemini.ts) has `geminiEmbed`, which asks for
+  `outputDimensionality: 768`. The model's full size is 3072 dimensions, but it's trained so the
+  first N numbers still work on their own ("Matryoshka" embeddings, like nesting dolls). 768 keeps
+  storage small and fits pgvector's fast index limit (2000 dimensions).
+
+> **Try it:** in the Supabase SQL editor, run `select context_text from startup_context;`. That's
+> exactly what got embedded. Would you describe your startup differently? Edit the profile, re-confirm,
+> and the context is rebuilt.
+
+---
+
+## 19. pgvector: vectors inside Postgres
+
+[supabase/migrations/0002_youtube_discovery.sql](supabase/migrations/0002_youtube_discovery.sql):
+
+```sql
+create extension if not exists vector with schema extensions;
+...
+embedding extensions.vector(768)
+```
+
+`pgvector` adds a `vector` column type and distance operators. The one we use is `<=>`, **cosine
+distance** (= 1 − cosine similarity). So relevance is computed *inside the database* in one
+statement:
+
+```sql
+update content_items ci
+   set relevance = 1 - (ci.embedding <=> sc.embedding)
+  from startup_context sc
+ where sc.startup_id = ci.startup_id and ci.startup_id = p_startup_id ...
+```
+
+Why do the maths in SQL instead of JavaScript?
+
+- **No data shipping.** Thousands of 768-number vectors never leave the database.
+- **Re-scoring is free.** If you re-confirm the profile, the context vector changes. Just re-run
+  `score_content_relevance()` and every video is re-scored **without re-embedding** a single one,
+  because each video's embedding is stored.
+- **Threshold at read time.** We store the relevance of *every* video and filter with `>= threshold`
+  when reading. Changing `relevanceThreshold` never needs a new YouTube search.
+
+Two helper functions are **server-only** (`revoke ... from authenticated; grant ... to service_role`):
+`set_content_embeddings` (saves 100 vectors in one round trip) and `score_content_relevance`.
+
+---
+
+## 20. Search queries in the viewer's words
+
+[lib/llm/queries.ts](lib/llm/queries.ts) asks the fast model for
+`{ niches: [{ name, queries[] }] }`, validated with zod (3–5 niches, 4–6 queries each).
+
+The prompt insists on how real viewers type:
+
+| Marketing words ❌ | Viewer words ✅ |
+|---|---|
+| "AI-powered invoicing platform" | "how to invoice clients as a freelancer" |
+| "streamline your cash flow" | "clients not paying on time what to do" |
+| "best-in-class solution" | "quickbooks vs wave for freelancers" |
+
+People with a problem search for **the problem**, not for your product category. Videos answering
+those searches are watched by exactly the audience you want.
+
+**The founder reviews the queries before anything is spent.** Queries are saved as `pending`, and
+the page shows them as editable inputs. Only "Start search" (`POST /api/campaigns/:id/start`) turns
+them into `queued` and emits `queries.confirmed`. Each query costs 100 quota units, so a human
+checks the plan first.
+
+---
+
+## 21. API quotas, pagination, batching ids, caching
+
+### Quotas
+
+A **quota** is how much of an API you may use per period. YouTube gives each project **10,000 units
+a day**, and different calls cost different amounts:
+
+| Call | Cost | What we use it for |
+|---|---|---|
+| `search.list` | **100** | find videos for a query |
+| `videos.list` | 1 | stats for up to 50 videos |
+| `channels.list` | 1 | stats for up to 50 channels |
+| `playlistItems.list` | 1 | a channel's latest uploads |
+
+So a run of 20 queries costs 2,000 units for searches plus about 50–200 for everything else.
+That's roughly 4 full runs a day. Searching is the expensive part, which is why queries get
+reviewed and cached.
+
+**How we count** ([lib/discovery/quota.ts](lib/discovery/quota.ts) and the `consume_quota` SQL
+function):
+
+1. **Reserve before calling.** Every YouTube call first asks the database for its units. If the
+   call crashes halfway, we've over-counted, never under-counted. Safe.
+2. **Atomic.** `update ... set units = units + p_units where units + p_units <= p_limit` runs as one
+   statement with a row lock, so two jobs running at the same moment can't both squeeze in past
+   the limit.
+3. **Stop at 9,000, not 10,000** (`youtubeDailyUnitStop`), which leaves headroom for mistakes and
+   for manual testing.
+4. **Pacific time.** Google resets the quota at midnight *Pacific*, so `quota_usage.day` is the
+   Pacific date ([lib/time.ts](lib/time.ts)). India is 12½–13½ hours ahead, so your "new day" and
+   Google's differ.
+
+### Pagination
+
+APIs don't return everything at once. A search returns at most 50 results plus a `nextPageToken`.
+Sending the token back returns the next 50:
+
+```
+search(q)               → 50 results + nextPageToken "CDIQAA"
+search(q, "CDIQAA")     → next 50   + nextPageToken "CGQQAA"
+...
+```
+
+Every page of `search.list` costs another 100 units, so `searchPagesPerQuery` is **1**. The loop
+in `searchVideos` ([lib/discovery/youtube.ts](lib/discovery/youtube.ts)) already supports more pages
+if you raise it.
+
+### Batching ids into one call
+
+`videos.list` accepts **up to 50 ids in one call, for 1 unit**. Fetching stats for 1,000 videos
+one by one would cost 1,000 units; in groups of 50 it costs 20. That's what
+[lib/array.ts](lib/array.ts)'s `chunk()` is for:
+
+```ts
+for (const batch of chunk(ids, 50)) {
+  await call("videos", { id: batch.join(","), ... }, 1 /* unit */, videosResponse);
+}
+```
+
+One more trick: every channel's uploads playlist id is its channel id with `UC` replaced by `UU`,
+so we get a channel's latest videos without an extra lookup call. We checked this against the real
+API before relying on it.
+
+### Caching
+
+**Caching** means saving a result so the same question isn't asked (and paid for) twice. The rule:
+*never repeat the same query for the same startup within 7 days*.
+
+- `search_queries.query_norm` is `lower(btrim(query))`, a **generated column**: Postgres computes it,
+  so "How To Invoice " and "how to invoice" count as the same query.
+- Before searching, the job looks for a row with the same `query_norm` searched in the last 7 days.
+  If it finds one, it reuses that row's `video_ids` and marks the new row `cached`, which costs
+  0 units.
+
+> **Try it:** run a search, then click "Search again" with the same queries. In the Inngest run, the
+> search steps return `{ cached: true }`, and the quota counter on the page doesn't move.
+
+---
+
+## 22. Retries, backoff, and typed errors
+
+Every platform module goes through [lib/discovery/http.ts](lib/discovery/http.ts):
+
+- **Retries** on network errors, 408, 429 and 5xx.
+- **Exponential backoff:** wait 1s, then 2s, then 4s. Hammering a struggling server makes things
+  worse.
+- **Jitter:** a random extra 0–250 ms, so many workers don't all retry at the same instant.
+- It **returns** 4xx responses instead of throwing, because only the platform module knows what
+  they mean.
+
+[lib/discovery/youtube.ts](lib/discovery/youtube.ts) turns YouTube's errors into **typed errors**
+([lib/discovery/types.ts](lib/discovery/types.ts)):
+
+| YouTube says | We throw | What happens |
+|---|---|---|
+| 403 `quotaExceeded` / `dailyLimitExceeded` | `QuotaExhaustedError` | pause until tomorrow (section 26) |
+| 400 / 401 / 403 / 404 (bad key, API off, missing) | `DiscoveryConfigError` | fail now: retrying can't fix a bad key |
+| 5xx, other | plain `Error` | Inngest retries the step |
+
+Every response is also **validated with zod** before use. YouTube sends counts as *strings*
+(`"viewCount": "1821702351"`), so `z.coerce.number()` converts them. Channels that hide their
+subscriber count get `null` ("unknown"), never 0, because 0 would wrongly pass or fail filters.
+
+The same idea applies to the LLM: a Gemini 429 becomes `LlmRateLimitError`, which
+[jobs/helpers.ts](jobs/helpers.ts) turns into Inngest's `RetryAfterError` ("wait 60 s, then retry
+only this step").
+
+---
+
+## 23. Upserts and unique constraints
+
+An **upsert** is "insert, or update if it already exists". It's what makes re-running safe:
+
+```ts
+await admin.from("content_items").upsert(rows, { onConflict: "startup_id,platform,video_id" });
+```
+
+Postgres needs to know **what "already exists" means**, and that's the job of a **unique
+constraint**:
+
+```sql
+constraint content_items_startup_video_key unique (startup_id, platform, video_id)
+```
+
+Without it, two queries finding the same video would create two rows, the video's views would be
+counted twice in the demand estimate, and the channel would look twice as relevant. Unique
+constraints protect data integrity **in the database**, so no code path can create duplicates.
+
+Upserts used in M2:
+
+| Table | Unique on | Why |
+|---|---|---|
+| `startup_context` | `startup_id` | one context per startup; re-confirming replaces it |
+| `content_items` | `startup_id, platform, video_id` | same video found by many queries = one row; stats refresh |
+| `creators` | `platform, handle` | shared pool: a channel found by two startups is **one** creator |
+| `matches` | `campaign_id, creator_id` | re-running refreshes rank, keeps fit scores |
+| `demand_estimates` | `startup_id, niche` | one estimate per niche |
+
+We store the YouTube **channel id** (`UCxxxx`) in `creators.handle`, not the @handle, because
+@handles can be changed by the creator and ids can't. A key that changes can't be a key.
+
+`platform` is in the `content_items` key on purpose: when Reddit is added, a Reddit post id can
+never collide with a YouTube video id.
+
+---
+
+## 24. Estimating demand (and why it's only an estimate)
+
+[lib/analysis/demand.ts](lib/analysis/demand.ts), a **pure function** (no database, no network):
+
+```
+per niche:  interested_estimate = Σ (views × relevance)   over videos with relevance ≥ threshold
+            total_comments      = Σ comments
+            top_video_ids       = the 3 videos with the biggest views × relevance
+```
+
+Multiplying by relevance means a view on a loosely related video counts less than a view on a
+spot-on one.
+
+### Why it's only an estimate
+
+| Weakness | Effect |
+|---|---|
+| **The same person watches many videos** | 10 relevant videos watched by the same 1,000 people count as 10,000 |
+| **Old views** | a video from 11 months ago counts all its views, even if interest has faded |
+| **Bots and rewatches** | view counts aren't unique humans |
+| **Views ≠ buyers** | a student researching "invoicing" isn't a freelancer who'll pay |
+| **Search ranking bias** | YouTube's top 50 results favour popular videos, so the long tail is missing |
+| **One niche per video** | a video found by two niches is credited to the first only |
+
+So the UI always says **"estimated interested views"** and shows the **evidence videos**. A founder
+can click them and judge for themselves. The honest use of this number is to **compare niches**
+("Freelance invoicing ≫ Small agency billing"), not to predict sales.
+
+---
+
+## 25. Building and ranking creators
+
+[jobs/build-creators.ts](jobs/build-creators.ts), step by step:
+
+1. **Group relevant videos by channel.** For each channel: relevant views, average relevance, number
+   of relevant videos.
+2. **Channel stats** (`channels.list`, 50 per call): subscribers, description, country, thumbnail.
+   Every channel goes into the shared `creators` pool.
+3. **Subscriber filter:** 5,000–200,000 (`DISCOVERY.subscribers`). Small but real channels.
+4. **Recent uploads** (`playlistItems.list`, 1 unit per channel, **only** for channels in range, to
+   save quota): last upload date plus the 10 latest titles (the LLM uses these later).
+5. **Activity filter:** uploaded within 60 days, and at least 1 relevant video.
+6. **Email:** [lib/discovery/email-extract.ts](lib/discovery/email-extract.ts) looks in the channel
+   description the creator published. It understands anti-spam spellings like
+   `name [at] domain [dot] com` and prefers emails near words like "business" or "sponsor". No other
+   site is fetched. Channels without an email are **kept but flagged** ("Email: No").
+7. **rank_score** saved to `matches`.
+
+### The formula
+
+[lib/analysis/score.ts](lib/analysis/score.ts):
+
+```
+rank_score = avg_relevance × log10(relevant_views + subscribers)
+```
+
+`log10` squashes size: 10k → 4, 100k → 5, 1M → 6. A channel 10× bigger only gets +1, so
+relevance (0–1) matters as much as size. That's what you want for **small** creators.
+
+**A trade-off the tests found:** at relevance 0.90 vs 0.76, a channel 7× bigger still *narrowly*
+wins (4.03 vs 4.00). The test `(known trade-off)` in [tests/score.test.ts](tests/score.test.ts)
+documents it. If you want relevance to dominate, try `avg_relevance² × log10(...)`, run `npm test`,
+and watch which tests change. That's exactly what tests are for.
+
+### The funnel
+
+The page shows where candidates drop out:
+`Videos found → Relevant → Channels → 5k–200k subs → Active → With email`. If you only get 12
+creators instead of 30, the funnel tells you which filter to loosen, or whether to add queries.
+
+---
+
+## 26. Batches of 20, idempotency, and sleeping until tomorrow
+
+### Why batch?
+
+[jobs/score-creators.ts](jobs/score-creators.ts) sends creators to the LLM **20 at a time**, and 30
+creators means 2 batches (20 + 10):
+
+| Reason | Explanation |
+|---|---|
+| **Rate limits** | the free Gemini tier allows a limited number of requests per minute; 2 calls instead of 30 |
+| **Cost and tokens** | one prompt with shared instructions + 20 creators is far cheaper than 20 prompts repeating the instructions |
+| **Partial progress** | each batch **saves immediately**; if batch 2 fails, batch 1's 20 creators are already on the page |
+| **Comparable scores** | the model sees 20 creators side by side, so its 0–100 scale is more consistent |
+
+Creators are labelled `c1…c20` instead of UUIDs, and the zod schema only allows exactly those
+labels (`z.enum(labels)`) and exactly 20 answers (`.length(20)`). The model **can't** invent a
+creator or skip one; if it tries, validation fails and `generateJson` retries.
+
+### Idempotency
+
+**Idempotent** means *doing it twice gives the same result as doing it once*. It's crucial with
+retries, because you never know if a crashed step "half happened". Two layers make scoring
+idempotent:
+
+1. **Inngest memoization.** `score-batch-1` finished means its result is saved, and a retry of the
+   function skips straight to `score-batch-2`.
+2. **The database decides what's left.** Each batch picks matches `where fit_score is null`, so even
+   a brand-new run (for example after "Search again") only scores what isn't scored yet. It never
+   pays twice for the same creator.
+
+### Sleeping until tomorrow
+
+When our 9,000-unit budget is used up, `runYoutubeStep` in [jobs/helpers.ts](jobs/helpers.ts):
+
+1. sets the campaign to `paused_quota` (the page shows *"YouTube quota reached, continuing tomorrow"*);
+2. calls `step.sleepUntil(midnight Pacific + 5 min)`. **The function is paused for free:** nothing
+   runs and nothing polls, and Inngest wakes it up;
+3. retries the same work under a new step id (`search-<id>-retry-1`).
+
+A subtle detail: "tomorrow" is computed **inside a `step.run`**. Inngest replays your function code
+on every step. If we called `nextPacificMidnight()` outside a step, each replay could compute a
+different time. Inside a step, the result is saved and replays reuse it. **Rule: anything
+non-deterministic (time, random numbers, API calls) goes inside a step.**
+
+---
+
+## 27. The Audience & Creators page: data fetching
+
+Files: [app/(app)/campaigns/[id]/creators/](app/(app)/campaigns/[id]/creators/)
+
+| Layer | Where | Why |
+|---|---|---|
+| First snapshot | `page.tsx` (server) calls `loadCampaignOverview` | the page arrives already filled in, with no spinner |
+| Live updates | `campaign-view.tsx` polls `GET /api/campaigns/:id` every 3 s **only while jobs run** | same pattern as M1's profile page |
+| Table data | `creators-table.tsx` fetches `GET /api/campaigns/:id/creators?page&sort&dir&hasEmail` | sorting and paging happen in the database, so it still works at 10,000 rows |
+
+The server snapshot and the API use **the same function**, `loadCampaignOverview` in
+[lib/campaigns.ts](lib/campaigns.ts), so they can never disagree.
+
+### A view for sorting by any column
+
+The table mixes columns from `matches` (fit, scores) and `creators` (subscribers, name). Sorting a
+parent table by a joined table's column is awkward through Supabase's API, so the migration creates
+a **view**, a saved query that behaves like a table:
+
+```sql
+create view public.campaign_creators with (security_invoker = true) as
+select m.*, c.display_name, c.audience_size as subscribers, (c.email is not null) as has_email,
+       row_number() over (partition by m.campaign_id, (m.removed_at is null)
+                          order by m.final_score desc nulls last) as final_rank
+from matches m join creators c on c.id = m.creator_id;
+```
+
+- `security_invoker = true` is **critical**. The view runs with the *caller's* permissions, so RLS on
+  `matches` still hides other founders' rows. Without it, a view runs as its owner and would leak
+  everything. (Our migration test checks this: user B sees 0 rows.)
+- `row_number() over (...)` is a **window function**: each row gets its rank without collapsing
+  rows like `GROUP BY` does. So "#3" stays #3 even when you sort by subscribers.
+- `has_email` exposes **yes or no, not the email itself**. The page only needs the flag.
+
+### A sort whitelist
+
+```ts
+sort: z.enum(CREATOR_SORT_COLUMNS).default("final_rank")
+```
+
+The column name comes from the URL, and anything not in the list is rejected. Never pass a URL
+value straight into a query as a column name.
+
+### React: fetch in an effect, set state in the callback
+
+ESLint rejected our first version of the table's effect (`react-hooks/set-state-in-effect`). The fix
+is the standard pattern: start the fetch in `useEffect`, set state in its `.then`, and use a
+`cancelled` flag so a slow old response can't overwrite a newer one when you click through pages
+quickly. "Remove" bumps a `reloadTick` counter that is in the effect's dependencies, which
+triggers a clean re-fetch.
+
+**Removed creators are hidden, not deleted** (`matches.removed_at`). That's reversible, keeps a
+history, and the PATCH route accepts `{ removed: false }` to restore one.
+
+---
+
+## 28. Unit tests with Vitest
+
+`npm test` runs [tests/](tests/) with Vitest: 27 tests in under a second.
+
+**What we test:** only **pure functions**, meaning same input, same output, no network, no database:
+`rankScore`, `finalScore`, `estimateDemand`, `extractBusinessEmail`, `chunk`, the Pacific-time
+helpers and `buildContextText`. That's why those live in [lib/analysis/](lib/analysis/) and
+[lib/discovery/email-extract.ts](lib/discovery/email-extract.ts), apart from the code that
+talks to APIs.
+
+A good test checks **behaviour you care about**, not just "it runs":
+
+```ts
+it("grows slowly with size: 10× the reach adds only +1 before relevance", ...)
+it("handles the night clocks change (DST ends Nov 1 2026)", ...)
+```
+
+**The tests caught a real surprise:** our first expectation, "a more relevant small channel always
+beats a big vague one", was **false** for the brief's formula. Instead of bending the test, we
+documented the trade-off (section 25). Tests turn assumptions into facts.
+
+Setup notes:
+- [vitest.config.mts](vitest.config.mts) maps `@/…` imports like the app does.
+- Installing Vitest 5 required upgrading `@types/node` from 20 to 24, to match the Node 24 you run.
+
+---
+
+## 29. M2 lessons and exercises
+
+### Lessons from building it
+
+1. **Measure thresholds with real data.** 0.6 would have kept cricket videos for an invoicing
+   startup.
+2. **Check API assumptions with cheap calls.** We confirmed the `UC→UU` uploads trick, field names
+   and the `404 playlistNotFound` reason for 3 units before relying on them.
+3. **Quota is a design constraint, not an afterthought.** It shaped query review, caching, 1 page
+   per query, id batching, and filtering *before* the per-channel calls.
+4. **Know which limits are per minute and which are per day, and what counts as one request.**
+   The first real runs failed with a Gemini `429`. The code treated every 429 as "wait a minute",
+   but this one was `EmbedContentRequestsPerDay…FreeTier` with a limit of **1,000**. Every *text*
+   counts, even inside a batch of 100, so two startups (825 + ~175 videos) used the whole day's
+   budget, and the third run failed after three pointless 60-second retries. The fix follows the
+   same pattern as YouTube:
+   - we **count embeddings ourselves** (`quota_usage` row `gemini_embed`, stop at 950, in
+     `embedMany`);
+   - a 429 whose quota id contains `PerDay` becomes `QuotaExhaustedError`, which **pauses the run
+     until midnight Pacific** instead of failing ([lib/llm/providers/gemini.ts](lib/llm/providers/gemini.ts));
+   - `runQuotaStep` ([jobs/helpers.ts](jobs/helpers.ts)) now wraps every quota-spending step,
+     YouTube and Gemini alike.
+
+   Rule of thumb: **a per-minute limit → wait and retry; a per-day limit → pause until reset; a bad
+   request → fail now.**
+5. **Runs can get stuck when the job runner restarts.** The Inngest dev server keeps runs in
+   memory, so stopping it mid-run leaves a campaign saying "Scoring…" forever.
+   [lib/campaign-status.ts](lib/campaign-status.ts) treats a run as stuck after 30 minutes without
+   progress, and the page then offers "Search again". The cache makes that cheap: 0 search units,
+   and only missing embeddings are redone.
+6. **Test the database like code.** The migration was applied to a local Postgres with pgvector
+   (PGlite 0.3; newer PGlite dropped the bundled vector extension), with 15 checks, including
+   "user B can't see A's creators through the view".
+
+### Exercises
+
+These were the parts you'd have written yourself. Try re-implementing or changing them now:
+
+1. **Tune the threshold.** After a real run, look at the spread of scores:
+   `select round(relevance::numeric,2) r, count(*) from content_items group by 1 order by 1 desc;`
+   Pick the value where titles stop being on-topic, and change `relevanceThreshold`. No re-search
+   needed (section 19).
+2. **Write `chunk()` yourself.** Delete the body in [lib/array.ts](lib/array.ts), rewrite it, and
+   run `npm test` until the `chunk` tests pass.
+3. **Change the ranking.** Make relevance count double (`avgRelevance ** 2`), update the
+   `(known trade-off)` test to match, and see whether your top 30 changes.
+4. **"Restore removed" button.** The API already supports `{ removed: false }`. Add a "Show removed
+   (n)" toggle to the table.
+5. **Show the quota in the Inngest run.** Make each `search-…` step return the units used so far
+   (hint: `reserveQuota` returns the new total).
+6. **Second platform (design only).** Sketch `lib/discovery/reddit.ts`: which functions, which
+   `DiscoveredContent` fields map from a Reddit post, and which event it would listen to. Don't
+   build it yet: check CLAUDE.md's rules and Reddit's API terms first.
+
+### Thinking questions
+
+7. Why does `consume_quota` reserve units **before** the API call instead of counting after?
+8. What would go wrong if `creators` were unique on `(platform, display_name)`?
+9. Why is `nextPacificMidnight()` called inside `step.run` and not directly in the function?
+10. The demand estimate for one niche is 2.4M. Give three reasons the real number of potential
+    customers is smaller.
+
+### Glossary (M2)
+
+- **Embedding**: a list of numbers representing the meaning of a text.
+- **Cosine similarity**: the angle-based similarity of two vectors; 1 = same meaning.
+- **pgvector**: the Postgres extension adding a `vector` type and distance operators (`<=>`).
+- **Quota**: an API usage allowance per period (YouTube: 10,000 units a day).
+- **Pagination**: fetching results page by page with a `nextPageToken`.
+- **Batching**: sending many items in one call (50 ids per `videos.list`, 20 creators per LLM call).
+- **Cache**: a saved result reused instead of asking again (7-day query cache).
+- **Backoff / jitter**: waiting longer after each failure, plus randomness.
+- **Upsert**: insert or update, keyed by a unique constraint.
+- **Idempotent**: safe to run twice; same result as running once.
+- **View / security_invoker**: a saved query; runs with the caller's permissions so RLS applies.
+- **Window function**: a per-row calculation over related rows (`row_number() over (...)`).
+- **Pure function**: same input → same output, no side effects; easy to unit test.

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
+import { FindCreatorsButton } from "./find-creators-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
@@ -243,7 +244,8 @@ function ProfileForm({
           ))}
         </div>
       </CardContent>
-      <CardFooter className="flex justify-end gap-2">
+      <CardFooter className="flex flex-wrap justify-end gap-2">
+        {confirmed && <FindCreatorsButton startupId={startupId} disabled={saving !== null} />}
         <Button variant="outline" onClick={() => submit("save")} disabled={saving !== null}>
           {saving === "save" ? "Saving…" : "Save draft"}
         </Button>

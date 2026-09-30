@@ -1,11 +1,14 @@
 import "server-only";
 import type { z } from "zod";
 import { serverEnv } from "@/lib/env";
+import { DISCOVERY } from "@/lib/config";
+import { chunk } from "@/lib/array";
+import { QUOTA, reserveQuota } from "@/lib/quota";
 import { anthropicProvider } from "./providers/anthropic";
-import { geminiProvider } from "./providers/gemini";
-import { LlmOutputError, type LlmProvider, type LlmTask } from "./providers/types";
+import { GEMINI_EMBED_BATCH, geminiEmbed, geminiProvider } from "./providers/gemini";
+import { LlmOutputError, LlmRateLimitError, type LlmProvider, type LlmTask } from "./providers/types";
 
-export { LlmOutputError, type LlmTask };
+export { LlmOutputError, LlmRateLimitError, type LlmTask };
 
 const PROVIDERS: Record<"anthropic" | "gemini", LlmProvider> = {
   anthropic: anthropicProvider,
@@ -56,4 +59,33 @@ export async function generateJson<S extends z.ZodType>({
     `${llm.name} output failed validation after ${maxAttempts} attempts: ${lastProblem}`,
     maxAttempts,
   );
+}
+
+/**
+ * Turns text into a vector (a list of DISCOVERY.embeddingDimensions numbers) whose direction
+ * captures its meaning. Similar meanings → vectors pointing the same way (high cosine similarity).
+ * Always uses Gemini: Anthropic has no embeddings API.
+ */
+export async function embed(text: string): Promise<number[]> {
+  const [vector] = await embedMany([text]);
+  return vector;
+}
+
+/**
+ * Embeds many texts, batching them into as few API calls as possible. Order is preserved.
+ * Each text counts against Gemini's free daily limit, so it's reserved first; when the budget
+ * is used up this throws QuotaExhaustedError and jobs pause until tomorrow.
+ */
+export async function embedMany(texts: string[]): Promise<number[][]> {
+  const vectors: number[][] = [];
+  for (const batch of chunk(texts, GEMINI_EMBED_BATCH)) {
+    await reserveQuota(QUOTA.geminiEmbed, batch.length, DISCOVERY.geminiEmbedDailyStop);
+    vectors.push(...(await geminiEmbed(batch, DISCOVERY.embeddingDimensions, "similarity")));
+  }
+  return vectors;
+}
+
+/** pgvector accepts vectors as text like "[0.1,0.2,0.3]". */
+export function toPgVector(vector: number[]): string {
+  return `[${vector.join(",")}]`;
 }

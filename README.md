@@ -4,12 +4,13 @@ Distribution copilot for early-stage startups. A founder pastes their URL; Distr
 profile, finds small/mid creators who reach their ICP, drafts outreach for human approval, and tracks
 replies and signups. See [CLAUDE.md](CLAUDE.md) for the product spec and hard rules.
 
-**Status: Milestone 1** — auth, onboarding, and the AI-built product profile.
+**Status: Milestone 2** — M1 (auth, onboarding, AI product profile) + YouTube discovery: audience estimate per niche and the top 30 small creators.
 
 ## Stack
 
 Next.js 16 (App Router) · TypeScript · Tailwind v4 · shadcn/ui · Supabase (Postgres, Auth, RLS) ·
-Inngest (background jobs) · LLM: Google Gemini (free tier, default) or Anthropic Claude · Jina Reader (page → markdown).
+Inngest (background jobs) · LLM: Google Gemini (free tier, default) or Anthropic Claude · Gemini embeddings + pgvector ·
+YouTube Data API v3 · Jina Reader (page → markdown) · Vitest.
 
 ## Setup
 
@@ -26,8 +27,8 @@ cp .env.example .env.local
 2. **Project Settings → API Keys**: copy the project URL, the **publishable** key and the **secret** key
    into `.env.local` (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`,
    `SUPABASE_SECRET_KEY`). The legacy `anon` / `service_role` keys also work.
-3. Apply the schema. Either paste [supabase/migrations/0001_init.sql](supabase/migrations/0001_init.sql)
-   into **SQL Editor** and run it, or with the Supabase CLI:
+3. Apply the schema: run each file in [supabase/migrations/](supabase/migrations/) **once, in order**
+   (`0001_init.sql`, then `0002_youtube_discovery.sql`) in the **SQL Editor**, or with the Supabase CLI:
    ```bash
    npx supabase link --project-ref <your-ref>
    npx supabase db push
@@ -52,12 +53,22 @@ The app talks to the LLM through one function, `generateJson()` in `lib/llm/clie
 
 Only the chosen provider's key is required.
 
-### 4. Jina Reader (optional key)
+### 4. YouTube Data API key (Milestone 2)
+
+1. [console.cloud.google.com](https://console.cloud.google.com) → create a project.
+2. **APIs & Services → Library** → enable **YouTube Data API v3**.
+3. **Credentials → Create credentials → API key**; restrict it to the YouTube Data API.
+4. Put it in `.env.local` as `YOUTUBE_API_KEY`.
+
+The free quota is 10,000 units/day (a search costs 100, a stats lookup 1). The app stops at 9,000 and resumes
+after midnight Pacific time. Usage per day is in the `quota_usage` table and on the creators page.
+
+### 5. Jina Reader (optional key)
 
 Page fetching goes through `https://r.jina.ai/` and works without a key. Set `JINA_API_KEY` for higher
 rate limits.
 
-### 5. Run
+### 6. Run
 
 Two terminals:
 
@@ -76,6 +87,7 @@ The Inngest dev server discovers functions at `http://localhost:3000/api/inngest
 | `npm run inngest`   | Local Inngest dev server + dashboard  |
 | `npm run dev:login -- you@x.com` | Print a sign-in link without sending email (local dev only; dodges Supabase's email rate limit) |
 | `npm run typecheck` | Generate route types, run `tsc`       |
+| `npm test`          | Unit tests (Vitest) in `tests/`       |
 | `npm run lint`      | ESLint                                |
 | `npm run build`     | Production build                      |
 
@@ -97,8 +109,26 @@ The Inngest dev server discovers functions at `http://localhost:3000/api/inngest
    │ edit form
    ├─ Save draft → PUT  /api/startups/:id/profile
    └─ Confirm    → POST /api/startups/:id/profile → status=confirmed, audit_log row,
-                                                    inngest: "profile.confirmed" (no handler yet)
+                                                    inngest: "profile.confirmed"
 ```
+
+## How M2 works (YouTube discovery)
+
+```
+profile.confirmed → build-context      embed profile → startup_context (pgvector)
+  context.built   → generate-queries   LLM writes viewer-style queries → search_queries (pending)
+"Find creators" (profile page) → campaign → /campaigns/:id/creators → founder edits queries
+"Start search" → queries.confirmed
+  → youtube-search     search.list per query (100 units, 7-day cache) + videos.list stats → content_items
+  → score-relevance    embed each video; relevance = cosine similarity in SQL (pgvector <=>)
+  → estimate-demand    Σ views × relevance per niche → demand_estimates
+  → build-creators     channels.list + recent uploads → creators; filters; rank_score → matches
+  → score-creators     LLM fit in batches of 20 until 30 scored; final_score; progress on the page
+```
+
+All tunable numbers (threshold, subscriber range, batch size, weights, quota stop) live in
+[lib/config.ts](lib/config.ts). If the daily quota runs out mid-run, the job sleeps until midnight Pacific
+and continues; finished steps are never repeated.
 
 ### Security notes
 
@@ -110,6 +140,9 @@ The Inngest dev server discovers functions at `http://localhost:3000/api/inngest
   `approved_by`/`approved_at`; founders can only set `draft`/`approved` (as themselves); only the server can
   move an approved message to `queued`/`sent`.
 - `SUPABASE_SECRET_KEY` is only used in `lib/supabase/admin.ts` (marked `server-only`).
+- M2 tables (`startup_context`, `content_items`, `demand_estimates`) are read-only to founders; `search_queries`
+  is editable by its owner; `quota_usage` and the quota/embedding SQL functions are server-only.
+  The `campaign_creators` view uses `security_invoker`, so RLS still applies through it.
 
 ## Project layout
 
@@ -117,9 +150,13 @@ The Inngest dev server discovers functions at `http://localhost:3000/api/inngest
 app/                  pages + API routes (app/(app)/* requires auth)
 proxy.ts              session refresh + auth redirect (Next 16's renamed middleware)
 inngest/client.ts     Inngest client + typed events
-jobs/                 Inngest functions
+jobs/                 Inngest functions (M1: build-profile; M2: discovery chain)
 lib/llm/              generateJson + prompts + zod schemas; providers/ = gemini, anthropic
 lib/fetch/reader.ts   Jina Reader fetch
+lib/discovery/        one module per platform (youtube.ts) + shared http retry, quota, types, email-extract
+lib/analysis/         pure scoring maths: context text, demand estimate, rank/final score
+lib/config.ts         every tunable number for discovery
+tests/                Vitest unit tests
 lib/supabase/         browser / server / admin / proxy clients
 supabase/migrations/  SQL migrations
 ```

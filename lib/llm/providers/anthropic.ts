@@ -2,7 +2,7 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { serverEnv } from "@/lib/env";
-import { LlmOutputError, type JsonAttempt, type JsonRequest, type LlmProvider, type LlmTask } from "./types";
+import { LlmOutputError, LlmRateLimitError, type JsonAttempt, type JsonRequest, type LlmProvider, type LlmTask } from "./types";
 
 const MODELS: Record<LlmTask, string> = {
   profile: "claude-sonnet-5-5",
@@ -38,6 +38,9 @@ export const anthropicProvider: LlmProvider = {
         fallbacks: "default",
       });
     } catch (error) {
+      if (error instanceof Anthropic.RateLimitError) {
+        throw new LlmRateLimitError(`Anthropic rate limit: ${error.message}`, 60_000, { cause: error });
+      }
       if (error instanceof Anthropic.APIError) throw error;
       // SDK-side JSON/schema parse failure: the model answered, but badly.
       return { kind: "retry", problem: error instanceof Error ? error.message : String(error) };

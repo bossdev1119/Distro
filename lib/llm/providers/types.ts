@@ -26,6 +26,20 @@ export interface LlmProvider {
   generate(request: JsonRequest): Promise<JsonAttempt>;
 }
 
+/**
+ * The provider said "too many requests" (HTTP 429). Jobs turn this into Inngest's
+ * RetryAfterError so the step waits instead of hammering the API.
+ */
+export class LlmRateLimitError extends Error {
+  constructor(message: string, readonly retryAfterMs: number, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "LlmRateLimitError";
+  }
+}
+
+/** Why a text is being embedded. Gemini tunes the vector slightly for the purpose. */
+export type EmbedPurpose = "similarity";
+
 export class LlmOutputError extends Error {
   constructor(message: string, readonly attempts: number) {
     super(message);
