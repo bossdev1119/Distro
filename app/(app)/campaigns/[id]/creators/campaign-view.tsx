@@ -68,8 +68,10 @@ export function CampaignView({ initial }: { initial: CampaignOverview }) {
               {campaign.stage === "scoring_creators" || campaign.stage === "done"
                 ? `Batch ${campaign.batches_done}/${campaign.batches_total} scored`
                 : STAGE_LABEL[campaign.stage]}
-              {" · "}Today: YouTube {quota.usedToday.toLocaleString()} / {quota.stopAt.toLocaleString()} units · Gemini embeddings{" "}
-              {quota.embedsToday.toLocaleString()} / {quota.embedStopAt.toLocaleString()}
+              {" · "}Today: YouTube {quota.usedToday.toLocaleString()} / {quota.stopAt.toLocaleString()} units
+              {quota.embedProvider === "gemini"
+                ? ` · Gemini embeddings ${quota.embedsToday.toLocaleString()} / ${quota.embedStopAt.toLocaleString()}`
+                : " · Embeddings: local model (no limit)"}
             </p>
           </div>
         )}

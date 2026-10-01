@@ -6,6 +6,7 @@ import { chunk } from "@/lib/array";
 import { QUOTA, reserveQuota } from "@/lib/quota";
 import { anthropicProvider } from "./providers/anthropic";
 import { GEMINI_EMBED_BATCH, geminiEmbed, geminiProvider } from "./providers/gemini";
+import { localEmbed, localModelId } from "./providers/local-embed";
 import { LlmOutputError, LlmRateLimitError, type LlmProvider, type LlmTask } from "./providers/types";
 
 export { LlmOutputError, LlmRateLimitError, type LlmTask };
@@ -64,7 +65,7 @@ export async function generateJson<S extends z.ZodType>({
 /**
  * Turns text into a vector (a list of DISCOVERY.embeddingDimensions numbers) whose direction
  * captures its meaning. Similar meanings → vectors pointing the same way (high cosine similarity).
- * Always uses Gemini: Anthropic has no embeddings API.
+ * EMBED_PROVIDER picks where it runs: "local" (open-source model on this machine) or "gemini".
  */
 export async function embed(text: string): Promise<number[]> {
   const [vector] = await embedMany([text]);
@@ -72,11 +73,24 @@ export async function embed(text: string): Promise<number[]> {
 }
 
 /**
- * Embeds many texts, batching them into as few API calls as possible. Order is preserved.
- * Each text counts against Gemini's free daily limit, so it's reserved first; when the budget
- * is used up this throws QuotaExhaustedError and jobs pause until tomorrow.
+ * Which model makes embeddings right now. Stored next to every vector (embedding_model column):
+ * vectors from different models can't be compared, so a mismatch means "re-embed me".
+ */
+export function embeddingModelId(): string {
+  const env = serverEnv();
+  return env.EMBED_PROVIDER === "local" ? localModelId(env.LOCAL_EMBED_MODEL) : env.GEMINI_MODEL_EMBED;
+}
+
+/**
+ * Embeds many texts. Order is preserved.
+ * - local: runs on this machine; no quota.
+ * - gemini: batches of 100 per API call. Each text counts against the free daily limit, so it's
+ *   reserved first; when the budget is used up this throws QuotaExhaustedError and jobs pause.
  */
 export async function embedMany(texts: string[]): Promise<number[][]> {
+  const env = serverEnv();
+  if (env.EMBED_PROVIDER === "local") return localEmbed(texts, env.LOCAL_EMBED_MODEL, DISCOVERY.embeddingDimensions);
+
   const vectors: number[][] = [];
   for (const batch of chunk(texts, GEMINI_EMBED_BATCH)) {
     await reserveQuota(QUOTA.geminiEmbed, batch.length, DISCOVERY.geminiEmbedDailyStop);

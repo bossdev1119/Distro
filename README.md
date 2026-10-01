@@ -9,7 +9,7 @@ replies and signups. See [CLAUDE.md](CLAUDE.md) for the product spec and hard ru
 ## Stack
 
 Next.js 16 (App Router) · TypeScript · Tailwind v4 · shadcn/ui · Supabase (Postgres, Auth, RLS) ·
-Inngest (background jobs) · LLM: Google Gemini (free tier, default) or Anthropic Claude · Gemini embeddings + pgvector ·
+Inngest (background jobs) · LLM: Google Gemini (free tier, default) or Anthropic Claude · embeddings (local bge-base via Transformers.js, or Gemini) + pgvector ·
 YouTube Data API v3 · Jina Reader (page → markdown) · Vitest.
 
 ## Setup
@@ -28,7 +28,7 @@ cp .env.example .env.local
    into `.env.local` (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`,
    `SUPABASE_SECRET_KEY`). The legacy `anon` / `service_role` keys also work.
 3. Apply the schema: run each file in [supabase/migrations/](supabase/migrations/) **once, in order**
-   (`0001_init.sql`, then `0002_youtube_discovery.sql`) in the **SQL Editor**, or with the Supabase CLI:
+   (`0001_init.sql`, `0002_youtube_discovery.sql`, `0003_embedding_model.sql`) in the **SQL Editor**, or with the Supabase CLI:
    ```bash
    npx supabase link --project-ref <your-ref>
    npx supabase db push
@@ -63,12 +63,21 @@ Only the chosen provider's key is required.
 The free quota is 10,000 units/day (a search costs 100, a stats lookup 1). The app stops at 9,000 and resumes
 after midnight Pacific time. Usage per day is in the `quota_usage` table and on the creators page.
 
-### 5. Jina Reader (optional key)
+### 5. Embeddings (no key needed)
+
+By default (`EMBED_PROVIDER=local`) embeddings run on your machine with the open-source
+`Xenova/bge-base-en-v1.5` model (768 dims, 8-bit quantized) through Transformers.js: free, no quota,
+~10 videos/second on a laptop CPU. The model (~100 MB) downloads on first use into `.cache/transformers`
+(git-ignored). Set `EMBED_PROVIDER=gemini` to use Gemini's API instead (free tier: 1,000 texts/day).
+Every vector stores the model that made it (`embedding_model`), so switching re-embeds automatically.
+Re-measure `relevanceThreshold` in `lib/config.ts` after switching: score ranges differ per model.
+
+### 6. Jina Reader (optional key)
 
 Page fetching goes through `https://r.jina.ai/` and works without a key. Set `JINA_API_KEY` for higher
 rate limits.
 
-### 6. Run
+### 7. Run
 
 Two terminals:
 
@@ -120,7 +129,7 @@ profile.confirmed → build-context      embed profile → startup_context (pgve
 "Find creators" (profile page) → campaign → /campaigns/:id/creators → founder edits queries
 "Start search" → queries.confirmed
   → youtube-search     search.list per query (100 units, 7-day cache) + videos.list stats → content_items
-  → score-relevance    embed each video; relevance = cosine similarity in SQL (pgvector <=>)
+  → score-relevance    embed each video (local model by default); relevance = cosine similarity in SQL
   → estimate-demand    Σ views × relevance per niche → demand_estimates
   → build-creators     channels.list + recent uploads → creators; filters; rank_score → matches
   → score-creators     LLM fit in batches of 20 until 30 scored; final_score; progress on the page

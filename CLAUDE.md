@@ -36,6 +36,9 @@ A founder pastes their startup URL. The app:
     claude-haiku-4-5 for scoring + reply classification
   - Callers pass a task ("profile" | "drafts" | "scoring" | "classify"), never a model id.
   - All LLM outputs are strict JSON validated with zod; retry once on validation failure.
+- Embeddings via embedMany() in lib/llm/client.ts, provider chosen by EMBED_PROVIDER:
+  local (default: Xenova/bge-base-en-v1.5 q8 via @huggingface/transformers, 768 dims, no quota)
+  or gemini (GEMINI_MODEL_EMBED). Vectors store embedding_model; never compare across models.
 - YouTube Data API v3, a web search API (Tavily or Serper), Firecrawl or Jina Reader for page fetching
 - Gmail API (scopes: gmail.send, gmail.readonly)
 

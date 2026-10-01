@@ -1,6 +1,6 @@
 import { contextBuilt, inngest, profileConfirmed, profileConfirmedData } from "@/inngest/client";
 import { buildContextText } from "@/lib/analysis/context";
-import { embed, toPgVector } from "@/lib/llm/client";
+import { embed, embeddingModelId, toPgVector } from "@/lib/llm/client";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { loadConfirmedProfile, runQuotaStep, toInngestError } from "./helpers";
 
@@ -37,7 +37,7 @@ export const buildContextJob = inngest.createFunction(
         const vector = await embed(contextText);
         const { error } = await createAdminClient()
           .from("startup_context")
-          .update({ embedding: toPgVector(vector), status: "generating_queries" })
+          .update({ embedding: toPgVector(vector), embedding_model: embeddingModelId(), status: "generating_queries" })
           .eq("startup_id", startupId);
         if (error) throw new Error(error.message);
         return { dimensions: vector.length };

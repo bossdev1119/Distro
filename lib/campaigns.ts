@@ -1,6 +1,7 @@
 import "server-only";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { DISCOVERY } from "@/lib/config";
+import { serverEnv } from "@/lib/env";
 import type { CampaignOverview, EvidenceVideo, NicheDemandCard, SearchQueryItem } from "@/lib/db/types";
 import { QUOTA, quotaUsedToday } from "@/lib/quota";
 
@@ -91,6 +92,7 @@ export async function loadCampaignOverview(supabase: SupabaseClient, campaignId:
       stopAt: DISCOVERY.youtubeDailyUnitStop,
       embedsToday,
       embedStopAt: DISCOVERY.geminiEmbedDailyStop,
+      embedProvider: serverEnv().EMBED_PROVIDER,
     },
   };
 }

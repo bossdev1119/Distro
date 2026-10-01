@@ -22,19 +22,24 @@ export const DISCOVERY = {
   // ── Relevance ───────────────────────────────────────────────────────────
   /**
    * Minimum cosine similarity between a video and the startup context to count as relevant.
-   * Measured with gemini-embedding-001 (768 dims): clearly related text ≈ 0.84, unrelated
-   * text (cricket vs invoicing) ≈ 0.67. So 0.6 keeps almost everything; start at 0.75.
+   * DEPENDS ON THE EMBEDDING MODEL — re-measure whenever EMBED_PROVIDER / the model changes.
+   * - local bge-base-en-v1.5 (q8), measured on 825 real videos: ≥0.60 all on-topic, ~0.55 mixed,
+   *   ≤0.50 junk (Roblox, news). Related pair 0.73, unrelated pair 0.29.
+   * - gemini-embedding-001: related 0.84, unrelated 0.67; use ~0.80 there.
    */
-  relevanceThreshold: 0.75,
+  relevanceThreshold: 0.6,
   /** Characters of the video description included in its embedding. */
   descriptionCharsForEmbedding: 500,
   /**
+   * Only used when EMBED_PROVIDER=gemini.
    * Gemini's free tier allows 1,000 embedded texts per day per project, and EVERY text counts
    * (a batch of 100 = 100). We stop a little early and resume after midnight Pacific time.
    * One search run of 20 queries finds ~700-900 videos, so budget roughly one startup per day
    * (or lower searchResultsPerPage to fit more).
    */
   geminiEmbedDailyStop: 950,
+  /** Videos embedded per Inngest step (local: ~10 s per 100 on a laptop CPU). */
+  embedBatchPerStep: 100,
   /** Must match the vector(768) columns in supabase/migrations/0002_youtube_discovery.sql. */
   embeddingDimensions: 768,
 

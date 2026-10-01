@@ -1,8 +1,7 @@
 import { NonRetriableError } from "inngest";
 import { inngest, relevanceScored, youtubeSearched } from "@/inngest/client";
 import { DISCOVERY } from "@/lib/config";
-import { embedMany, toPgVector } from "@/lib/llm/client";
-import { GEMINI_EMBED_BATCH } from "@/lib/llm/providers/gemini";
+import { embed, embeddingModelId, embedMany, toPgVector } from "@/lib/llm/client";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { markCampaignFailed, mergeCampaignStats, runQuotaStep, setStage, toInngestError } from "./helpers";
 
@@ -21,7 +20,35 @@ export const scoreRelevanceJob = inngest.createFunction(
     const { campaignId, startupId } = event.data;
     await step.run("set-stage", () => setStage(campaignId, "scoring_relevance"));
 
-    // Only videos without an embedding yet: already-embedded ones are never paid for twice.
+    // The model in use right now. Saved in a step so every replay uses the same value.
+    const model = await step.run("embedding-model", () => embeddingModelId());
+
+    // The startup context must be embedded by the SAME model as the videos (different models =
+    // different "maps"). If the model changed since the profile was confirmed, re-embed it.
+    await runQuotaStep(step, "ensure-context-embedding", { campaignId, resumeStage: "scoring_relevance" }, async () => {
+      const admin = createAdminClient();
+      const { data: context, error } = await admin
+        .from("startup_context")
+        .select("context_text, embedding_model")
+        .eq("startup_id", startupId)
+        .maybeSingle<{ context_text: string; embedding_model: string | null }>();
+      if (error) throw new Error(error.message);
+      if (!context) throw new NonRetriableError("No startup context yet: confirm the profile first");
+      if (context.embedding_model === model) return { reembedded: false };
+      try {
+        const vector = await embed(context.context_text);
+        const { error: saveError } = await admin
+          .from("startup_context")
+          .update({ embedding: toPgVector(vector), embedding_model: model })
+          .eq("startup_id", startupId);
+        if (saveError) throw new Error(saveError.message);
+        return { reembedded: true };
+      } catch (err) {
+        throw toInngestError(err);
+      }
+    });
+
+    // Videos with no embedding, or one made by a different model. Never embedded twice per model.
     let embedded = 0;
     for (let batch = 1; batch <= MAX_EMBED_BATCHES; batch++) {
       const count = await runQuotaStep(step, `embed-batch-${batch}`, { campaignId, resumeStage: "scoring_relevance" }, async () => {
@@ -30,8 +57,9 @@ export const scoreRelevanceJob = inngest.createFunction(
           .from("content_items")
           .select("id, title, description")
           .eq("startup_id", startupId)
-          .is("embedding", null)
-          .limit(GEMINI_EMBED_BATCH)
+          // embedding_model is null (never embedded) OR not the current model. Quoted: the id contains "/" and "@".
+          .or(`embedding_model.is.null,embedding_model.neq."${model}"`)
+          .limit(DISCOVERY.embedBatchPerStep)
           .returns<{ id: string; title: string; description: string }[]>();
         if (error) throw new Error(error.message);
         if (data.length === 0) return 0;
@@ -46,6 +74,7 @@ export const scoreRelevanceJob = inngest.createFunction(
         const { error: saveError } = await admin.rpc("set_content_embeddings", {
           p_ids: data.map((v) => v.id),
           p_embeddings: vectors.map(toPgVector),
+          p_model: model,
         });
         if (saveError) throw new Error(saveError.message);
         return data.length;
@@ -56,14 +85,6 @@ export const scoreRelevanceJob = inngest.createFunction(
 
     const scored = await step.run("score-relevance", async () => {
       const admin = createAdminClient();
-      const { data: context, error: ctxError } = await admin
-        .from("startup_context")
-        .select("status")
-        .eq("startup_id", startupId)
-        .maybeSingle<{ status: string }>();
-      if (ctxError) throw new Error(ctxError.message);
-      if (!context) throw new NonRetriableError("No startup context yet: confirm the profile first");
-
       // The actual math runs in Postgres: relevance = 1 - (video.embedding <=> context.embedding).
       const { data, error } = await admin.rpc("score_content_relevance", { p_startup_id: startupId });
       if (error) throw new Error(error.message);

@@ -90,7 +90,7 @@ export type CampaignOverview = {
   context: { status: ContextStatus; error: string | null } | null;
   queries: SearchQueryItem[];
   demand: NicheDemandCard[];
-  quota: { usedToday: number; stopAt: number; embedsToday: number; embedStopAt: number };
+  quota: { usedToday: number; stopAt: number; embedsToday: number; embedStopAt: number; embedProvider: "local" | "gemini" };
 };
 
 /** One row of the creators table (from the campaign_creators view). */

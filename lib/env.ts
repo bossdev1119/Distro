@@ -11,7 +11,10 @@ const serverEnvSchema = z
     GEMINI_API_KEY: z.string().optional(),
     GEMINI_MODEL: z.string().min(1).default("gemini-flash-latest"),
     GEMINI_FAST_MODEL: z.string().min(1).default("gemini-flash-lite-latest"),
-    // Embeddings always use Gemini (Anthropic has no embeddings API), so they need GEMINI_API_KEY.
+    // Embeddings: "local" runs an open-source model on this machine (free, no quota);
+    // "gemini" uses the API (free tier: 1,000 texts/day). Both produce 768-dim vectors.
+    EMBED_PROVIDER: z.enum(["local", "gemini"]).default("local"),
+    LOCAL_EMBED_MODEL: z.string().min(1).default("Xenova/bge-base-en-v1.5"),
     GEMINI_MODEL_EMBED: z.string().min(1).default("gemini-embedding-001"),
     YOUTUBE_API_KEY: z.string().optional(),
     ANTHROPIC_API_KEY: z.string().optional(),

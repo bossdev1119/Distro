@@ -1119,6 +1119,35 @@ removes "how long the text was", so only direction (meaning) counts.
 | "Python" matches both the snake and the language | Context decides which one is meant |
 | Needs you to guess every synonym | Synonyms come for free |
 
+### Which model makes the embeddings?
+
+Distro can use two, chosen by `EMBED_PROVIDER` in `.env.local`:
+
+| | **local** (default) | **gemini** |
+|---|---|---|
+| Model | `bge-base-en-v1.5`, open-source, 8-bit quantized | `gemini-embedding-001` |
+| Runs | on your CPU, inside the Next.js server ([lib/llm/providers/local-embed.ts](lib/llm/providers/local-embed.ts)) | Google's servers |
+| Limit | none (~10 videos/second measured on your laptop) | 1,000 texts/day on the free tier |
+| Cost | free (~100 MB model download, once) | free tier, then paid |
+
+We started with Gemini because the brief named it, then switched to local after the free tier's
+daily limit stopped real runs (section 29). The switch touched **one function**, `embedMany()`,
+because every caller goes through it. That's the same adapter idea as the LLM providers.
+
+**"Quantized"** means the model's weights are stored as 8-bit integers instead of 32-bit floats:
+4× smaller and about 1.6× faster here, with nearly identical scores (average difference 0.007 on 200
+real videos, and 45 of the top 50 the same). Always check that trade-off with your own data.
+
+**Never compare vectors from different models.** Each model builds its own "map of meaning", so a
+Gemini vector and a bge vector are like coordinates from two different atlases. Migration
+[0003_embedding_model.sql](supabase/migrations/0003_embedding_model.sql) stores the model id next to
+every vector (`embedding_model`):
+- the relevance SQL only compares vectors with the **same** tag;
+- `score-relevance` re-embeds the context and any video whose tag doesn't match the current model.
+
+So when you move to a better model for real users, you change one setting and old vectors are
+redone automatically.
+
 ### We measured it (and changed the brief's threshold)
 
 Before writing code we embedded three sentences with **your** Gemini key:
@@ -1129,9 +1158,24 @@ invoice vs cricket     : 0.674   ← unrelated, but still 0.67!
 ```
 
 Gemini's embeddings rarely go near 0 for normal text, and even unrelated sentences score about
-0.6–0.7. A threshold of 0.6 would have kept **everything**. That's why
-`relevanceThreshold` starts at **0.75** in [lib/config.ts](lib/config.ts). **Lesson: measure before
-you trust a number from a spec.**
+0.6–0.7. A threshold of 0.6 would have kept **everything**, so we set 0.75 for Gemini. **Lesson:
+measure before you trust a number from a spec.**
+
+**Then we switched to the local bge model and measured again**, on mixar's 825 real videos:
+
+```
+invoice vs invoice-app : 0.73
+invoice vs cricket     : 0.29   ← a much wider gap than Gemini's
+~0.64  "MetaHuman Facial Rig Transfer for Blender"       on-topic
+~0.60  "How to Rig a Hand in Blender 5.2"                 on-topic
+~0.57  "Van Helsing's Flying Vampire Brides" + "UV Unwrap"  mixed
+~0.49  "How To Make MILLIONS in Grow A Garden 2!"          junk
+```
+
+So `relevanceThreshold` is now **0.60**. The same number means different things for different
+models, which is why the config comment says to re-measure after any model change. To do it
+yourself, sort videos by relevance and read titles around the cut-off, as in exercise 1 of
+section 29.
 
 ### Where it lives in the code
 
